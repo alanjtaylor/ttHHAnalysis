@@ -1,0 +1,11 @@
+# this makefile also gets parsed by shell scripts
+# therefore it does not support full make syntax and features
+# edit with care
+
+PACKAGE              = RootCore
+PACKAGE_NOCC         = 1
+PACKAGE_AUTODEP      = 1000
+PACKAGE_PEDANTIC     = 1
+PACKAGE_RECURSIVE_UT = ut_load_packages.sh ut_load_packages_preload_reflex.sh
+
+include $(ROOTCOREDIR)/Makefile-common

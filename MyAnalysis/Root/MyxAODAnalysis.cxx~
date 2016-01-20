@@ -1,0 +1,338 @@
+#include <EventLoop/Job.h>
+#include <EventLoop/StatusCode.h>
+#include <EventLoop/Worker.h>
+#include <MyAnalysis/MyxAODAnalysis.h>
+// Infrastructure include(s):
+#include "xAODRootAccess/Init.h"
+#include "xAODRootAccess/TEvent.h"
+#include "xAODRootAccess/tools/Message.h"
+// EDM includes:
+#include "xAODEventInfo/EventInfo.h"
+#include "xAODTruth/TruthParticle.h"
+#include "xAODTruth/TruthParticleContainer.h"
+#include "xAODMissingET/MissingETContainer.h"
+#include "UpgradePerformanceFunctions/UpgradePerformanceFunctions.h"
+
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <cstdlib>
+
+#include "xAODJet/JetContainer.h"
+#include "xAODTruth/TruthEvent.h"
+#include "xAODTruth/TruthEventContainer.h"
+
+/// Helper macro for checking xAOD::TReturnCode return values
+#define EL_RETURN_CHECK( CONTEXT, EXP )                 \
+  do {                                                  \
+    if( ! EXP.isSuccess() ) {			        \
+      Error( CONTEXT,				        \
+	     XAOD_MESSAGE( "Failed to execute: %s" ),	\
+	     #EXP );					\
+      return EL::StatusCode::FAILURE;			\
+    }							\
+  } while( false )
+
+
+// this is needed to distribute the algorithm to the workers
+ClassImp(MyxAODAnalysis)
+
+
+
+MyxAODAnalysis :: MyxAODAnalysis ()
+{
+  // Here you put any code for the base initialization of variables,
+  // e.g. initialize all pointers to 0.  Note that you should only put
+  // the most basic initialization here, since this method will be
+  // called on both the submission and the worker node.  Most of your
+  // initialization code will go into histInitialize() and
+  // initialize().
+
+  averageMuValue = 0.;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: setupJob (EL::Job& job)
+{
+  // Here you put code that sets up the job on the submission object
+  // so that it is ready to work with your algorithm, e.g. you can
+  // request the D3PDReader service or add output files.  Any code you
+  // put here could instead also go into the submission script.  The
+  // sole advantage of putting it here is that it gets automatically
+  // activated/deactivated when you add/remove the algorithm from your
+  // job, which may or may not be of value to you.
+  // let's initialize the algorithm to use the xAODRootAccess package
+  job.useXAOD ();
+  //  xAOD::Init(); // call before opening first file
+  EL_RETURN_CHECK( "setupJob()", xAOD::Init() ); // call before opening first file       
+
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: histInitialize ()
+{
+  // Here you do everything that needs to be done at the very
+  // beginning on each worker node, e.g. create histograms and output
+  // trees.  This method gets called before any input files are
+  // connected.
+  h_muonUnsmearedPt = new TH1F("h_muonUnsmearedPt", "Muon unsmeared p_{T} [GeV]", 100, 0., 200.);
+  h_muonSmearedPt = new TH1F("h_muonSmearedPt", "Muon smeared p_{T} [GeV]", 100, 0., 200.);
+  h_rawMETPhi = new TH1F("h_rawMETPhi", "Raw MET #phi direction", 100, -7., 7.);
+  h_smearedMETPhi = new TH1F("h_smearedMETPhi", "Smeared MET #phi direction", 100, -7., 7.);
+
+  h_jetUnsmearedE = new TH1F("h_jetUnsmearedE", "Unsmeared jet energy.. Entries/20GeV", 25, 0.0, 500.0);
+  h_jetSmearedE = new TH1F("h_jetSmearedE", " Smeared jet energy.. Entries/20GeV", 25, 0.0, 500.0);
+  h_percentDiff = new TH1F("h_percentDiff", " percent Diff.. Entries /2.5%", 80, -100.0, 100.0);
+
+
+
+  
+  outputTree = new TTree("outputTree", "Example output tree");
+  outputTree->Branch("EventNumber", &outputEventNumber);
+  outputTree->Branch("PileupJetSize", &outputPileupJetSize);
+
+  wk()->addOutput(h_jetUnsmearedE);
+  wk()->addOutput(h_jetSmearedE);
+  wk()->addOutput(h_percentDiff);
+  
+  wk()->addOutput(h_muonUnsmearedPt);
+  wk()->addOutput(h_muonSmearedPt);
+  wk()->addOutput(h_rawMETPhi);
+  wk()->addOutput(h_smearedMETPhi);
+
+  wk()->addOutput(outputTree);
+
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: fileExecute ()
+{
+  // Here you do everything that needs to be done exactly once for every
+  // single file, e.g. collect a list of all lumi-blocks processed
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: changeInput (bool firstFile)
+{
+  // Here you do everything you need to do when we change input files,
+  // e.g. resetting branch addresses on trees.  If you are using
+  // D3PDReader or a similar service this method is not needed.
+  if (firstFile) {}
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: initialize ()
+{
+  // Here you do everything that you need to do after the first input
+  // file has been connected and before the first event is processed,
+  // e.g. create additional histograms based on which variables are
+  // available in the input files.  You can also create all of your
+  // histograms and trees in here, but be aware that this method
+  // doesn't get called if no events are processed.  So any objects
+  // you create here won't be available in the output if you have no
+  // input events.
+  xAOD::TEvent* event = wk()->xaodEvent();
+  m_random3.SetSeed(1); // for local smearing
+
+  Info("initialize()", "Setting up UpgradePerformanceFunctions with mu=%f", averageMuValue); 
+
+  // Initializations specific to UpgradePerformanceFunctions
+  m_upgrade = new UpgradePerformanceFunctions();
+  m_upgrade->setLayout(UpgradePerformanceFunctions::gold);
+  m_upgrade->setAvgMu(averageMuValue);
+  m_upgrade->setElectronWorkingPoint(UpgradePerformanceFunctions::looseElectron);
+  m_upgrade->setElectronRandomSeed(1);
+  m_upgrade->setMuonWorkingPoint(UpgradePerformanceFunctions::tightMuon);
+  m_upgrade->loadMETHistograms("/afs/cern.ch/user/a/altaylor/tthh_bbbb_smear/UpgradePerformanceFunctions/share/sumetPU_mu200_ttbar_gold.root");
+
+  m_upgrade->setJetRandomSeed(1);
+
+  
+  m_upgrade->setPileupRandomSeed(1);
+  m_upgrade->setPileupRandomSeed(1);
+  m_upgrade->setPileupJetPtThresholdMeV(30000.);
+  m_upgrade->setPileupEfficiencyScheme(UpgradePerformanceFunctions::PileupEff::HS);
+  m_upgrade->setPileupEff(0.9);
+  m_upgrade->setPileupTemplatesPath("/afs/cern.ch/atlas/groups/UpgradePhysics/PerformanceFunctions/");
+
+  // as a check, let's see the number of events in our xAOD
+  Info("initialize()", "Number of events = %lli", event->getEntries() ); // print long long int
+  m_eventCounter = 0;
+
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: execute ()
+{
+  // Here you do everything that needs to be done on every single
+  // events, e.g. read input variables, apply cuts, and fill
+  // histograms and trees.  This is where most of your actual analysis
+  // code will go.
+  xAOD::TEvent* event = wk()->xaodEvent();
+
+  // print every 100 events, so we know where we are:
+  if( (m_eventCounter % 100) == 0 ) 
+    Info("execute()", "Event number = %i", m_eventCounter );
+  m_eventCounter++;
+  
+  //----------------------------
+  // Event information
+  //--------------------------- 
+  const xAOD::EventInfo* eventInfo = 0;
+  EL_RETURN_CHECK("execute",event->retrieve( eventInfo, "EventInfo"));  
+  outputEventNumber = eventInfo->eventNumber();
+  
+  // check if the event is data or MC
+    bool isMC = false;
+  if(eventInfo->eventType( xAOD::EventInfo::IS_SIMULATION ) ){
+    isMC = true;
+  }   
+
+  if (isMC) {
+    const xAOD::TruthParticleContainer* truthCont = 0;
+    EL_RETURN_CHECK("execute", event->retrieve(truthCont, "TruthParticles"));
+    Info("execute()", "number of truth particles = %lu", truthCont->size());
+    xAOD::TruthParticleContainer::const_iterator part_itr = truthCont->begin();
+    xAOD::TruthParticleContainer::const_iterator part_end = truthCont->end();
+    for (; part_itr != part_end; ++part_itr) {
+      if ((*part_itr)==0) continue;
+      if ((*part_itr)->status()==1) {
+     	if (abs((*part_itr)->pdgId())==13 && 
+	    (*part_itr)->pt()>15000.) {
+	  float muonUnsmearedPt = (*part_itr)->pt();
+	  float muonPtResolution = m_upgrade->getMuonPtResolution((*part_itr)->pt(), (*part_itr)->eta());
+	  float muonSmearedPt = muonUnsmearedPt + m_random3.Gaus(0., muonPtResolution);
+	  h_muonUnsmearedPt->Fill(muonUnsmearedPt/1000.);
+	  h_muonSmearedPt->Fill(muonSmearedPt/1000.);
+	}
+      }
+    }
+
+
+    // get jet container of interest                                                                                                                                      
+    const xAOD::JetContainer* jets = 0;
+    EL_RETURN_CHECK("execute()",event->retrieve( jets, "AntiKt4TruthJets" ));
+    Info("execute()", "  number of jets = %lu", jets->size());
+    xAOD::JetContainer::const_iterator jet_itr = jets->begin();
+    xAOD::JetContainer::const_iterator jet_end = jets->end();
+
+    for( ; jet_itr != jet_end; ++jet_itr ) {
+
+      // hold onto jets which have P_{T} > 30GeV (30,000MeV)
+      if ( (*jet_itr)->pt() > 30000 ) {
+
+      float jetEnergy = (*jet_itr)->e();
+      float jetSmearedEnergy = m_upgrade->getJetSmearedEnergy((*jet_itr)->pt(), (*jet_itr)->eta(), true);
+
+      h_jetSmearedE->Fill(jetSmearedEnergy/1000.0);
+      h_jetUnsmearedE->Fill(jetEnergy/1000.0);
+
+      h_percentDiff->Fill(  ( (jetSmearedEnergy - jetEnergy)/jetEnergy)*100.0);
+            
+      std::cout << " true jet energy is " << jetEnergy/1000.0 << std::endl;
+      std::cout << " smeared jet energy is " << jetSmearedEnergy/1000.0 << std::endl;
+      // std::cout << " smeared jet energy v2 is " << jetSmearedEnergyV2/1000.0 << std::endl;
+      
+      }
+      
+
+    }
+      
+      //if (  (*jet_itr)->pt()*0.001 > 30.0 ) {
+      //aJet.SetPxPyPzE((*jet_itr)->px()*0.001,(*jet_itr)->py()*0.001,(*jet_itr)->pz()*0.001, (*jet_itr)->e()*0.001);
+      //lorentzJets.push_back(aJet)
+
+    /*const xAOD::MissingETContainer* METCont = 0;
+    EL_RETURN_CHECK("execute", event->retrieve(METCont, "MET_Truth"));
+    Info("execute()", "number of truth MET = %lu", METCont->size());
+    const xAOD::MissingET* metTruth = 0;
+    if( METCont ) metTruth = (*METCont)["NonInt"];
+    std::cout << "MET is " << metTruth->met() << std::endl;
+
+    // Real check of MET smearing
+    h_rawMETPhi->Fill(metTruth->phi());
+    std::cout << metTruth->sumet() << " ; "
+	      << metTruth->mpx() << " ; " 
+	      << metTruth->mpy() << std::endl;
+    UpgradePerformanceFunctions::MET smearedMET = m_upgrade->getMETSmeared(metTruth->sumet(), metTruth->mpx(), metTruth->mpy());
+    if (smearedMET.first == 0) std::cout << "0 MET" << std::endl;
+    else h_smearedMETPhi->Fill(atan2(smearedMET.second, smearedMET.first)); */
+
+  } 
+  // This is just a test of some methods without realistic input.
+  // float eventMETreso = m_upgrade->getMETResolution(100.0, UpgradePerformanceFunctions::METSyst::nominal);
+  //Info("execute()", "MET resolution test result is %f", eventMETreso);
+
+  float muonPtResolution = m_upgrade->getMuonPtResolution(500., 2.0);
+  Info("execute()", "Muon pT resolution at pT=500 GeV, eta=2.0 is %f", muonPtResolution);
+  muonPtResolution = m_upgrade->getMuonPtResolution(7000., 4.5);
+  Info("execute()", "Muon pT resolution at pT=7000 GeV, eta=4.5 is %f", muonPtResolution);
+
+  std::vector<TLorentzVector> pileupJets = m_upgrade->getPileupJets();
+  std::cout << "Found " <<  pileupJets.size() << " pileup jets above threshold" << std::endl;
+  std::cout << "Track Confirmation Efficiency for PU pT=40 GeV, eta=1.0 is "
+  << m_upgrade->getTrackJetConfirmEff(40000., 1.0, "PU") << std::endl; 
+
+    //  outputTree->Fill();
+  return EL::StatusCode::SUCCESS;
+
+
+
+
+  
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: postExecute ()
+{
+  // Here you do everything that needs to be done after the main event
+  // processing.  This is typically very rare, particularly in user
+  // code.  It is mainly used in implementing the NTupleSvc.
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: finalize ()
+{
+  // This method is the mirror image of initialize(), meaning it gets
+  // called after the last event has been processed on the worker node
+  // and allows you to finish up any objects you created in
+  // initialize() before they are written to disk.  This is actually
+  // fairly rare, since this happens separately for each worker node.
+  // Most of the time you want to do your post-processing on the
+  // submission node after all your histogram outputs have been
+  // merged.  This is different from histFinalize() in that it only
+  // gets called on worker nodes that processed input events.
+
+  return EL::StatusCode::SUCCESS;
+}
+
+
+
+EL::StatusCode MyxAODAnalysis :: histFinalize ()
+{
+  // This method is the mirror image of histInitialize(), meaning it
+  // gets called after the last event has been processed on the worker
+  // node and allows you to finish up any objects you created in
+  // histInitialize() before they are written to disk.  This is
+  // actually fairly rare, since this happens separately for each
+  // worker node.  Most of the time you want to do your
+  // post-processing on the submission node after all your histogram
+  // outputs have been merged.  This is different from finalize() in
+  // that it gets called on all worker nodes regardless of whether
+  // they processed input events.
+  return EL::StatusCode::SUCCESS;
+}
